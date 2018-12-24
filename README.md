@@ -3,6 +3,7 @@
 ## Introduction
 
 `decgen` can generate boilerplate code to handle
+
 * tracing requests using opentrace,
 * manage database/sql transactions,
 * create adapters to use generated grpc servers as clients,
@@ -25,7 +26,7 @@ To use `decgen` to generate a decorator first you need to create your interface.
 
 ```go
 type Service interface {
-	Do(ctx, *Request) (*Response, error)
+    Do(ctx, *Request) (*Response, error)
 }
 ```
 

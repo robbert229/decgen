@@ -1,216 +1,19 @@
 // This program generates decorators that wrap interfaces. Useful for all manner of things.
 
-package main
+package decgen
 
 import (
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/types"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/gojuno/generator"
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/loader"
-	)
-
-var (
-	interfaceName = flag.String("i", "", "interface name")
-	structName    = flag.String("s", "", "target struct name, default: <interface name>Tracer")
-	outputFile    = flag.String("o", "", "output filename")
-	decType       = flag.String("t", "", "decorator type [trace,sqltx,grpcadapter,mutex]")
 )
-
-const mutexTemplate = `
-        // {{$structName}} ensures that only one call can be active at a time using a mutext.
-        type {{$structName}} struct {
-                next {{$interfaceName}}
-                mutex *sync.Mutex
-        }
-
-        // New{{$structName}} returns a new {{$structName}}
-        func New{{$structName}}(next {{$interfaceName}}) *{{$structName}} {
-                return &{{$structName}} {
-                        next: next,
-                        mutex: new(sync.Mutex),
-                }
-        }
-
-        {{ range $methodName, $method := .}}
-                // {{$methodName}} wraps the underlying {{$interfaceName}} implementation with a mutex.
-                func (t *{{$structName}}) {{$methodName}}{{signature $method}} {
-                        t.mutex.Lock()
-                        defer t.mutex.Unlock()
-
-                        var err error
-                        {{results $method}} t.next.{{$methodName}}({{call $method}})
-                        if err != nil {
-                                return {{returnerr $method}} errors.WithStack(err)
-                        }
-
-                        return {{returnok $method}}
-                }
-        {{ end }}
-`
-
-const traceTemplate = `
-        // {{$structName}} traces any calls to the next service using opentracing.
-        type {{$structName}} struct {
-                next {{$interfaceName}}
-                prefix string
-        }
-        // New{{$structName}} returns a new {{$structName}}
-        func New{{$structName}}(next {{$interfaceName}}, prefix string) *{{$structName}} {
-                return &{{$structName}} {
-                        next: next,
-                        prefix: prefix,
-                }
-        }
-
-        {{ range $methodName, $method := . }}
-                // {{$methodName}} wraps the underlying {{$interfaceName}} implementation with transactions.
-                func (t *{{$structName}}) {{$methodName}}{{signature $method}} {
-                        span, ctx := opentracing.StartSpanFromContext(ctx, t.prefix + ".{{$interfaceName}}.{{$methodName}}")
-                        defer span.Finish()
-
-                        var err error
-                        {{results $method}} t.next.{{$methodName}}({{call $method}})
-                        if err != nil {
-                                return {{returnerr $method}} errors.WithStack(err)
-                        }
-
-                        return {{returnok $method}}
-                }
-        {{ end }}
-`
-
-const grpcadapterTemplate = `
-        // {{$structName}} is an adaptor that allows a generated grpc server to be utilized like a client.
-        type {{$structName}} struct {
-                next {{grpcadapterclient $interfaceName}}
-        }
-
-        // New{{$structName}} returns a new {{$structName}}
-        func New{{$structName}}(next {{grpcadapterclient $interfaceName}}) *{{$structName}} {
-                return &{{$structName}} {
-                        next: next,
-                }
-        }
-
-        {{ range $methodName, $method := . }}
-                // {{$methodName}} wraps the underlying {{$interfaceName}} and removing the grpc call options.
-                func (t *{{$structName}}) {{$methodName}}{{signature $method}} {
-                        var err error
-                        {{results $method}} t.next.{{$methodName}}({{callgrpcadapter $method}})
-                        if err != nil {
-                                return {{returnerr $method}} errors.WithStack(err)
-                        }
-
-                        return {{returnok $method}}
-                }
-        {{ end }}
-
-`
-
-const sqltxTemplate = `
-        // {{$structName}} manages transactions around repository pattern structs.
-        type {{$structName}} struct {
-                db *sql.DB
-                constructor func(tx sql.Tx) {{$interfaceName}}
-        }
-        // New{{$structName}} returns a new {{$structName}}
-        func New{{$structName}}(db *sql.DB, constructor func(db boil.Executor) {{$interfaceName}}) *{{$structName}} {
-                return &{{$structName}} {
-                        db: db,
-                        constructor: constructor,
-                }
-        }
-
-        {{ range $methodName, $method := . }}
-                // {{$methodName}} wraps the underlying {{$interfaceName}} implementation with transactions.
-                func (t *{{$structName}}) {{$methodName}}{{signature $method}} {
-                        {{if mutates $methodName}}
-                                tx, err := t.db.Begin()
-                                if err != nil {
-                                        return {{returnerr $method}} errors.New("unable to start transaction")
-                                }
-
-                                repository := t.constructor(tx)
-                                {{results $method}} repository.{{$methodName}}({{call $method}})
-                                if err != nil {
-                                        txErr := tx.Rollback()
-                                        if txErr != nil {
-                                                // handle rollback failed
-                                                return {{returnerr $method}} errors.Wrapf(err, "failed to rollback transaction for error (%v)", txErr)
-                                        }
-                                        return {{returnerr $method}} errors.WithStack(err)
-                                }
-
-                                err = tx.Commit()
-                                if err != nil {
-                                        // handle failed commit
-                                        return {{returnerr $method}} errors.WithStack(err)
-                                }
-
-                                return {{returnok $method}}
-                        {{ else }}
-                                repository := t.constructor(t.db)
-
-                                {{results $method}} repository.{{$methodName}}({{call $method}})
-                                if err != nil {
-                                        return {{returnerr $method}} errors.WithStack(err)
-                                }
-
-                                return {{returnok $method}}
-                        {{ end }}
-                }
-        {{ end }}
-        `
-
-var (
-	templates = map[string]string{
-		"sqltx":       sqltxTemplate,
-		"trace":       traceTemplate,
-		"grpcadapter": grpcadapterTemplate,
-		"mutex":       mutexTemplate,
-	}
-)
-
-func main() {
-	flag.Parse()
-
-	if *interfaceName == "" || *outputFile == "" || flag.NArg() != 1 || *decType == "" {
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	template, ok := templates[*decType]
-	if !ok {
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	if *structName == "" {
-		*structName = fmt.Sprintf("%vTracer", *interfaceName)
-	}
-
-	fn := func(s *types.Signature) error {
-		if s.Params().Len() == 0 || s.Params().At(0).Type().String() != "context.Context" {
-			return errors.Errorf("first param must be context.Context")
-		}
-
-		return nil
-	}
-
-	gen := NewGenerator(template, []validatorFunc{fn})
-	err := gen.Generate(template, flag.Arg(0), *interfaceName, *outputFile, *structName)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
 
 type validatorFunc func(s *types.Signature) error
 
@@ -221,7 +24,7 @@ type Generator struct {
 }
 
 // NewGenerator returns a new generator.
-func NewGenerator(template string, validators []validatorFunc) *Generator {
+func NewGenerator(template string, validators ...validatorFunc) *Generator {
 	return &Generator{
 		template:   template,
 		validators: validators,
@@ -293,7 +96,6 @@ func (g *Generator) Generate(template, sourcePackage, interfaceName, outputFile,
 
 	return nil
 }
-
 
 // createProgram creates the program.
 func (g *Generator) createProgram(sourcePath, destPath string) (*loader.Program, error) {
@@ -433,7 +235,7 @@ func FuncGRPCAdapterServer(g *generator.Generator) interface{} {
 		}
 
 		if !strings.HasSuffix(s, "Client") {
-			return "", fmt.Errorf("didn't recieve a client")
+			return "", fmt.Errorf("the specified interface wasn't a client")
 		}
 
 		s = strings.TrimSuffix(s, "Client")
@@ -483,7 +285,29 @@ func FuncReturnErr(g *generator.Generator) interface{} {
 
 			emptyValue := "nil"
 
-			switch result.Type {
+			switch asserted := result.OriginalType.(type) {
+			case *types.Named:
+				switch asserted.Underlying().String() {
+				case "int64":
+					emptyValue = "0"
+				case "string":
+					emptyValue = `""`
+				case "bool":
+					emptyValue = "false"
+				default:
+					panic(fmt.Sprintf("no nil value for named type known: %s, %s", asserted.String(), asserted.Underlying().String()))
+				}
+			case *types.Basic:
+				switch asserted.Name() {
+				case "int64":
+					emptyValue = "0"
+				case "string":
+					emptyValue = `""`
+				case "bool":
+					emptyValue = "false"
+				default:
+					panic(fmt.Sprintf("no nil value for basic type known: %s", asserted.Name()))
+				}
 
 			}
 
