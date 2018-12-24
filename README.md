@@ -14,24 +14,31 @@ utilize other implementations of those interfaces.
 
 ## usage
 
-Downloading `decgen` is done using go get.
-
-```bash
-go get github.com/robbert229/decgen
-```
-
-### trace
-
-To use `decgen` to generate a decorator first you need to create your interface. 
+Add the following file to your project under `scripts/decgen.go`
 
 ```go
+// +build ignore
+
+package main
+
+import "github.com/robbert229/decgen/cmd"
+
+func main() {
+	cmd.Execute()
+}
+```
+
+`decgen` then needs to be installed with either `go get`, or `dep`. 
+
+Add the following file to your project under `./service.go`
+
+```go
+package pkg
+
 type Service interface {
     Do(ctx, *Request) (*Response, error)
 }
 ```
 
-```bash
-
-decgen -i Service -s TracingService -o ./tracer.go -t trace .
-
-```
+Then run `decgen` by calling `go run ./scripts/decgen.go -i Service -s TracingService -o ./tracer.go -t trace .`
+This will run `decgen` generating a tracing decorator for the given `Service` interface. 
